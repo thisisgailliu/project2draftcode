@@ -1,0 +1,61 @@
+works.csv
+work_id
+title
+author_id
+publication_year
+genre
+represented_period
+publisher
+fulltext_source
+
+authors.csv
+author_id
+birth_year
+birthplace
+migration_year
+generation
+education
+degree_field
+career_before_writing
+career_during_writing
+class_background
+
+economy.csv
+year
+income
+poverty
+education_rate
+professional_share
+unemployment
+homeownership
+foreign_born_share
+
+intentions.csv
+author_id
+date
+quotation
+source
+coded_theme
+
+later/at the end: topics.csv
+work_id
+topic_1
+topic_2
+topic_3
+
+chinese_american_lit/
+│
+├── data/
+│   ├── works.csv
+│   ├── authors.csv
+│   ├── economy.csv
+│   ├── intentions.csv
+│   ├── annotations.csv          # optional, for supervised learning
+│   │
+│   └── texts/
+│       ├── book001.txt
+│       ├── book002.txt
+│       ├── book003.txt
+│       └── ...
+│
+└── outputs/
