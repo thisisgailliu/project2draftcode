@@ -1,0 +1,1738 @@
+!pip install -q \
+pandas numpy matplotlib plotly openpyxl \
+scikit-learn nltk \
+bertopic sentence-transformers umap-learn hdbscan \
+statsmodels joblib
+
+
+from pathlib import Path
+from collections import Counter
+import re
+import warnings
+
+import numpy as np
+import pandas as pd
+
+import matplotlib.pyplot as plt
+
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+
+from sklearn.feature_extraction.text import (
+    CountVectorizer,
+    TfidfVectorizer)
+
+from sklearn.decomposition import LatentDirichletAllocation
+
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix)
+
+from sentence_transformers import SentenceTransformer
+
+from bertopic import BERTopic
+from umap import UMAP
+from hdbscan import HDBSCAN
+
+import statsmodels.formula.api as smf
+
+import joblib
+
+warnings.filterwarnings("ignore")
+
+
+
+
+  
+RANDOM_STATE = 42
+
+# Change this to wherever your project folder is located.
+PROJECT_DIR = Path("chinese_american_lit")
+
+DATA_DIR = PROJECT_DIR / "data"
+OUTPUT_DIR = PROJECT_DIR / "outputs"
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Around 1,000–2,000 words is a reasonable starting point.
+CHUNK_SIZE = 1200
+
+# Some overlap keeps passages from being cut too abruptly.
+CHUNK_OVERLAP = 100
+
+# IMPORTANT:
+# Do not mix full novels and Goodreads summaries in the same model.
+ALLOWED_TEXT_TYPES = {"full_text"}
+
+# Which time variable should control historical analysis?
+TIME_VARIABLE = "publication_year"
+
+# If later you create a represented_year column, you could instead use:
+# TIME_VARIABLE = "represented_year"
+
+
+
+  
+  
+N_LDA_TOPICS = 12
+
+MAX_FEATURES = 8000
+
+MIN_DF = 3
+MAX_DF = 0.95
+
+NGRAM_RANGE = (1, 2)
+
+
+
+
+  
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+BERT_MIN_CLUSTER_SIZE = 10
+
+
+
+
+  
+# ECONOMIC-DATA SETTINGS
+# If Census data are available only every 10 years,
+# match each literary work with the nearest economic observation.
+ECONOMIC_YEAR_TOLERANCE = 10
+
+
+
+
+  
+# 3. NLTK RESOURCES
+nltk.download("stopwords")
+nltk.download("wordnet")
+nltk.download("omw-1.4")
+
+STOP_WORDS = set(stopwords.words("english"))
+
+lemmatizer = WordNetLemmatizer()
+
+
+
+
+  
+# 4. LOAD METADATA
+works = pd.read_csv(DATA_DIR / "works.csv")
+authors = pd.read_csv(DATA_DIR / "authors.csv")
+economy = pd.read_csv(DATA_DIR / "economy.csv")
+
+# Intentions are optional.
+intentions_path = DATA_DIR / "intentions.csv"
+
+if intentions_path.exists():
+    intentions = pd.read_csv(intentions_path)
+else:
+    intentions = pd.DataFrame()
+
+print("Works:", works.shape)
+print("Authors:", authors.shape)
+print("Economy:", economy.shape)
+
+
+
+
+  
+(# 5. CHECK REQUIRED COLUMNS
+required_work_columns = [
+    "work_id",
+    "title",
+    "author_id",
+    "publication_year",
+    "text_path"]
+
+missing = [
+    col for col in required_work_columns
+    if col not in works.columns]
+
+if missing:
+    raise ValueError(f"works.csv is missing columns: {missing}")
+
+
+
+
+  
+# 6. FILTER TEXT TYPES
+if "text_type" in works.columns:
+
+    works = works[ works["text_type"].isin(ALLOWED_TEXT_TYPES)].copy()
+
+
+print(f"Works retained after text-type filtering: {len(works)}")
+
+
+
+
+  
+# 7. READ TEXT FILES
+def read_text_file(relative_path):
+
+    path = DATA_DIR / relative_path
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Cannot find text: {path}"
+        )
+
+    return path.read_text(
+        encoding="utf-8",
+        errors="ignore")
+
+works["text"] = works["text_path"].apply(read_text_file)
+
+print(
+    "Total words:",
+    works["text"]
+    .str.split()
+    .str.len()
+    .sum())
+
+
+
+
+  
+# 8. CREATE DECADE VARIABLE
+works["decade"] = (
+    works[TIME_VARIABLE] // 10) * 10
+
+
+
+
+  
+# 9. DIVIDE NOVELS INTO CHUNKS
+def chunk_text(
+    text,
+    chunk_size=1200,
+    overlap=100):
+
+    words = text.split()
+
+    chunks = []
+
+    start = 0
+
+    while start < len(words):
+
+        end = start + chunk_size
+
+        chunk = words[start:end]
+
+        if len(chunk) >= 100:
+            chunks.append(
+                " ".join(chunk))
+
+        start += chunk_size - overlap
+
+    return chunks
+
+chunk_rows = []
+
+for _, row in works.iterrows():
+
+    chunks = chunk_text(
+        row["text"],
+        CHUNK_SIZE,
+        CHUNK_OVERLAP)
+
+    for i, chunk in enumerate(chunks):
+
+        chunk_rows.append({
+
+            "chunk_id":
+                f"{row['work_id']}_chunk_{i:04d}",
+
+            "work_id":
+                row["work_id"],
+
+            "title":
+                row["title"],
+
+            "author_id":
+                row["author_id"],
+
+            "publication_year":
+                row["publication_year"],
+
+            "decade":
+                row["decade"],
+
+            "text":
+                chunk
+        })
+
+chunks = pd.DataFrame(chunk_rows)
+
+print(
+    "Number of chunks:",
+    len(chunks))
+
+
+
+
+  
+# 10. TEXT CLEANING FOR LDA
+def clean_for_lda(text):
+
+    text = text.lower()
+
+  # Keep alphabetic words and apostrophes.
+    tokens = re.findall(
+        r"\b[a-zA-Z][a-zA-Z']+\b",
+        text)
+
+    cleaned = []
+
+    for token in tokens:
+
+        if token in STOP_WORDS:
+            continue
+
+        if len(token) <= 2:
+            continue
+
+        lemma = lemmatizer.lemmatize(token)
+
+        cleaned.append(lemma)
+
+    return " ".join(cleaned)
+
+chunks["lda_text"] = (
+    chunks["text"]
+    .apply(clean_for_lda)
+)
+
+
+# ================================================================
+# 11. LIGHT CLEANING FOR BERTOPIC
+# ================================================================
+
+def clean_for_bertopic(text):
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
+
+
+chunks["bertopic_text"] = (
+    chunks["text"]
+    .apply(clean_for_bertopic)
+)
+
+
+# ================================================================
+# 12. SAVE CHUNKS
+# ================================================================
+
+chunks.to_csv(
+    OUTPUT_DIR / "corpus_chunks.csv",
+    index=False
+)
+
+
+# ================================================================
+# 13. WORD FREQUENCY BY DECADE
+# ================================================================
+
+frequency_results = []
+
+
+for decade, group in chunks.groupby("decade"):
+
+    words = " ".join(
+        group["lda_text"]
+    ).split()
+
+    counts = Counter(words)
+
+    for word, frequency in counts.most_common(100):
+
+        frequency_results.append({
+
+            "decade": decade,
+
+            "word": word,
+
+            "frequency": frequency
+        })
+
+
+word_frequency = pd.DataFrame(
+    frequency_results
+)
+
+
+word_frequency.to_csv(
+    OUTPUT_DIR /
+    "word_frequency_by_decade.csv",
+    index=False
+)
+
+
+print("\nMost frequent words:")
+print(
+    word_frequency.head(20)
+)
+
+
+# ================================================================
+# 14. TF-IDF ANALYSIS
+# ================================================================
+
+tfidf_vectorizer = TfidfVectorizer(
+
+    stop_words="english",
+
+    min_df=MIN_DF,
+
+    max_df=MAX_DF,
+
+    max_features=MAX_FEATURES,
+
+    ngram_range=NGRAM_RANGE
+)
+
+
+tfidf_matrix = (
+    tfidf_vectorizer.fit_transform(
+        chunks["lda_text"]
+    )
+)
+
+
+tfidf_terms = np.array(
+    tfidf_vectorizer
+    .get_feature_names_out()
+)
+
+
+tfidf_results = []
+
+
+for decade in sorted(
+    chunks["decade"].unique()
+):
+
+    mask = (
+        chunks["decade"]
+        .values == decade
+    )
+
+    decade_matrix = (
+        tfidf_matrix[mask]
+    )
+
+    average_scores = np.asarray(
+        decade_matrix.mean(axis=0)
+    ).ravel()
+
+    top_indexes = (
+        average_scores
+        .argsort()[::-1][:50]
+    )
+
+    for index in top_indexes:
+
+        tfidf_results.append({
+
+            "decade":
+                decade,
+
+            "term":
+                tfidf_terms[index],
+
+            "tfidf":
+                average_scores[index]
+        })
+
+
+tfidf_by_decade = pd.DataFrame(
+    tfidf_results
+)
+
+
+tfidf_by_decade.to_csv(
+
+    OUTPUT_DIR /
+    "tfidf_by_decade.csv",
+
+    index=False
+)
+
+
+# ================================================================
+# 15. LDA: CREATE COUNT VECTORS
+# ================================================================
+
+count_vectorizer = CountVectorizer(
+
+    stop_words="english",
+
+    min_df=MIN_DF,
+
+    max_df=MAX_DF,
+
+    max_features=MAX_FEATURES,
+
+    ngram_range=NGRAM_RANGE
+)
+
+
+X_counts = (
+    count_vectorizer
+    .fit_transform(
+        chunks["lda_text"]
+    )
+)
+
+
+print(
+    "LDA document-term matrix:",
+    X_counts.shape
+)
+
+
+# ================================================================
+# 16. TRAIN LDA
+# ================================================================
+
+lda_model = LatentDirichletAllocation(
+
+    n_components=N_LDA_TOPICS,
+
+    max_iter=50,
+
+    learning_method="batch",
+
+    random_state=RANDOM_STATE,
+
+    n_jobs=-1
+)
+
+
+lda_document_topics = (
+    lda_model.fit_transform(
+        X_counts
+    )
+)
+
+
+# ================================================================
+# 17. DISPLAY LDA TOP WORDS
+# ================================================================
+
+feature_names = (
+    count_vectorizer
+    .get_feature_names_out()
+)
+
+
+def extract_lda_topics(
+    model,
+    feature_names,
+    n_words=15
+):
+
+    rows = []
+
+    for topic_number, topic in enumerate(
+        model.components_
+    ):
+
+        top_indexes = (
+            topic
+            .argsort()[::-1][:n_words]
+        )
+
+        words = [
+            feature_names[i]
+            for i in top_indexes
+        ]
+
+        rows.append({
+
+            "topic":
+                topic_number,
+
+            "top_words":
+                ", ".join(words)
+        })
+
+    return pd.DataFrame(rows)
+
+
+lda_topics = extract_lda_topics(
+    lda_model,
+    feature_names
+)
+
+
+print("\nLDA TOPICS")
+print(lda_topics.to_string(index=False))
+
+
+lda_topics.to_csv(
+
+    OUTPUT_DIR /
+    "lda_topic_words.csv",
+
+    index=False
+)
+
+
+# ================================================================
+# 18. ADD LDA TOPIC PROPORTIONS TO EVERY CHUNK
+# ================================================================
+
+lda_topic_columns = []
+
+
+for i in range(N_LDA_TOPICS):
+
+    column = f"LDA_topic_{i}"
+
+    chunks[column] = (
+        lda_document_topics[:, i]
+    )
+
+    lda_topic_columns.append(column)
+
+
+chunks.to_csv(
+
+    OUTPUT_DIR /
+    "chunks_with_lda_topics.csv",
+
+    index=False
+)
+
+
+# ================================================================
+# 19. AGGREGATE LDA TO WORK LEVEL
+# ================================================================
+
+lda_work = (
+
+    chunks
+
+    .groupby([
+        "work_id",
+        "title",
+        "author_id",
+        "publication_year",
+        "decade"
+    ])[lda_topic_columns]
+
+    .mean()
+
+    .reset_index()
+)
+
+
+lda_work.to_csv(
+
+    OUTPUT_DIR /
+    "lda_topics_by_work.csv",
+
+    index=False
+)
+
+
+# ================================================================
+# 20. AGGREGATE LDA TO DECADE
+# ================================================================
+
+lda_decade = (
+
+    chunks
+
+    .groupby("decade")[
+        lda_topic_columns
+    ]
+
+    .mean()
+
+    .reset_index()
+)
+
+
+lda_decade.to_csv(
+
+    OUTPUT_DIR /
+    "lda_topics_by_decade.csv",
+
+    index=False
+)
+
+
+# ================================================================
+# 21. PLOT EACH LDA TOPIC OVER TIME
+# ================================================================
+
+for topic in lda_topic_columns:
+
+    plt.figure(figsize=(8, 5))
+
+    plt.plot(
+        lda_decade["decade"],
+        lda_decade[topic],
+        marker="o"
+    )
+
+    plt.xlabel(
+        "Publication decade"
+    )
+
+    plt.ylabel(
+        "Average topic prevalence"
+    )
+
+    plt.title(
+        f"{topic} over time"
+    )
+
+    plt.tight_layout()
+
+    plt.savefig(
+        OUTPUT_DIR /
+        f"{topic}_trend.png",
+        dpi=300
+    )
+
+    plt.close()
+
+
+# ================================================================
+# 22. BERTopic EMBEDDINGS
+# ================================================================
+
+print(
+    "\nLoading SentenceTransformer..."
+)
+
+
+embedding_model = SentenceTransformer(
+    EMBEDDING_MODEL
+)
+
+
+bert_documents = (
+    chunks["bertopic_text"]
+    .tolist()
+)
+
+
+embeddings = embedding_model.encode(
+
+    bert_documents,
+
+    show_progress_bar=True,
+
+    batch_size=32,
+
+    normalize_embeddings=True
+)
+
+
+print(
+    "Embedding shape:",
+    embeddings.shape
+)
+
+
+# ================================================================
+# 23. BERTopic COMPONENTS
+# ================================================================
+
+umap_model = UMAP(
+
+    n_neighbors=15,
+
+    n_components=5,
+
+    min_dist=0.0,
+
+    metric="cosine",
+
+    random_state=RANDOM_STATE
+)
+
+
+hdbscan_model = HDBSCAN(
+
+    min_cluster_size=BERT_MIN_CLUSTER_SIZE,
+
+    metric="euclidean",
+
+    cluster_selection_method="eom",
+
+    prediction_data=True
+)
+
+
+bert_vectorizer = CountVectorizer(
+
+    stop_words="english",
+
+    ngram_range=(1, 2),
+
+    min_df=2
+)
+
+
+# ================================================================
+# 24. TRAIN BERTopic
+# ================================================================
+
+topic_model = BERTopic(
+
+    embedding_model=embedding_model,
+
+    umap_model=umap_model,
+
+    hdbscan_model=hdbscan_model,
+
+    vectorizer_model=bert_vectorizer,
+
+    verbose=True
+)
+
+
+bert_topics, bert_probs = (
+
+    topic_model.fit_transform(
+
+        bert_documents,
+
+        embeddings
+    )
+)
+
+
+# ================================================================
+# 25. BERTopic INFORMATION
+# ================================================================
+
+bert_topic_info = (
+    topic_model
+    .get_topic_info()
+)
+
+
+print("\nBERTopic topics:")
+print(
+    bert_topic_info.head(20)
+)
+
+
+bert_topic_info.to_csv(
+
+    OUTPUT_DIR /
+    "bertopic_topics.csv",
+
+    index=False
+)
+
+
+# ================================================================
+# 26. DOCUMENT-LEVEL BERTopic RESULTS
+# ================================================================
+
+bert_document_info = (
+    topic_model
+    .get_document_info(
+        bert_documents
+    )
+)
+
+
+# Add IDs back.
+bert_document_info.insert(
+    0,
+    "chunk_id",
+    chunks["chunk_id"].values
+)
+
+bert_document_info.insert(
+    1,
+    "work_id",
+    chunks["work_id"].values
+)
+
+bert_document_info.insert(
+    2,
+    "author_id",
+    chunks["author_id"].values
+)
+
+bert_document_info.insert(
+    3,
+    "publication_year",
+    chunks["publication_year"].values
+)
+
+bert_document_info.insert(
+    4,
+    "decade",
+    chunks["decade"].values
+)
+
+
+bert_document_info.to_csv(
+
+    OUTPUT_DIR /
+    "bertopic_document_topics.csv",
+
+    index=False
+)
+
+
+# ================================================================
+# 27. BERTopic PREVALENCE BY WORK
+# ================================================================
+
+# Topic -1 = outliers.
+# Keep it available for diagnostics,
+# but exclude it from substantive topic prevalence.
+
+valid_bert = (
+    bert_document_info[
+        bert_document_info["Topic"] != -1
+    ]
+)
+
+
+bert_work_prevalence = pd.crosstab(
+
+    valid_bert["work_id"],
+
+    valid_bert["Topic"],
+
+    normalize="index"
+)
+
+
+bert_work_prevalence.columns = [
+
+    f"BERTopic_{column}"
+
+    for column
+    in bert_work_prevalence.columns
+]
+
+
+bert_work_prevalence = (
+
+    bert_work_prevalence
+    .reset_index()
+)
+
+
+bert_work_prevalence.to_csv(
+
+    OUTPUT_DIR /
+    "bertopic_prevalence_by_work.csv",
+
+    index=False
+)
+
+
+# ================================================================
+# 28. BERTopic PREVALENCE BY DECADE
+# ================================================================
+
+bert_decade_prevalence = pd.crosstab(
+
+    valid_bert["decade"],
+
+    valid_bert["Topic"],
+
+    normalize="index"
+)
+
+
+bert_decade_prevalence.columns = [
+
+    f"BERTopic_{column}"
+
+    for column
+    in bert_decade_prevalence.columns
+]
+
+
+bert_decade_prevalence = (
+
+    bert_decade_prevalence
+    .reset_index()
+)
+
+
+bert_decade_prevalence.to_csv(
+
+    OUTPUT_DIR /
+    "bertopic_prevalence_by_decade.csv",
+
+    index=False
+)
+
+
+# ================================================================
+# 29. BERTopic TOPICS OVER TIME
+# ================================================================
+
+timestamps = (
+    chunks["publication_year"]
+    .astype(int)
+    .tolist()
+)
+
+
+unique_years = (
+    chunks["publication_year"]
+    .nunique()
+)
+
+
+if unique_years > 40:
+
+    nr_bins = 20
+
+else:
+
+    nr_bins = None
+
+
+topics_over_time = (
+
+    topic_model
+    .topics_over_time(
+
+        bert_documents,
+
+        timestamps,
+
+        nr_bins=nr_bins
+    )
+)
+
+
+topics_over_time.to_csv(
+
+    OUTPUT_DIR /
+    "bertopic_topics_over_time.csv",
+
+    index=False
+)
+
+
+# Interactive HTML visualization.
+try:
+
+    fig = (
+        topic_model
+        .visualize_topics_over_time(
+            topics_over_time
+        )
+    )
+
+    fig.write_html(
+
+        OUTPUT_DIR /
+        "bertopic_topics_over_time.html"
+    )
+
+except Exception as e:
+
+    print(
+        "BERTopic visualization skipped:",
+        e
+    )
+
+
+# ================================================================
+# 30. CREATE MASTER WORK-LEVEL DATASET
+# ================================================================
+
+analysis_data = lda_work.copy()
+
+
+analysis_data = analysis_data.merge(
+
+    bert_work_prevalence,
+
+    on="work_id",
+
+    how="left"
+)
+
+
+# ================================================================
+# 31. MERGE AUTHOR INFORMATION
+# ================================================================
+
+analysis_data = analysis_data.merge(
+
+    authors,
+
+    on="author_id",
+
+    how="left"
+)
+
+
+# ================================================================
+# 32. MERGE ECONOMIC DATA
+# ================================================================
+
+economy = economy.copy()
+
+
+economy["year"] = (
+    economy["year"]
+    .astype(int)
+)
+
+
+# Rename so we can see which Census/ACS year
+# was matched to each literary work.
+economy = economy.rename(
+    columns={
+        "year": "economic_year"
+    }
+)
+
+
+analysis_data = (
+    analysis_data
+    .sort_values("publication_year")
+)
+
+
+economy = (
+    economy
+    .sort_values("economic_year")
+)
+
+
+analysis_data = pd.merge_asof(
+
+    analysis_data,
+
+    economy,
+
+    left_on="publication_year",
+
+    right_on="economic_year",
+
+    direction="nearest",
+
+    tolerance=ECONOMIC_YEAR_TOLERANCE
+)
+
+
+# ================================================================
+# 33. ADD MANUALLY CODED AUTHORIAL INTENTIONS
+# ================================================================
+
+if (
+    not intentions.empty
+    and
+    "coded_theme"
+    in intentions.columns
+):
+
+    intention_counts = pd.crosstab(
+
+        intentions["author_id"],
+
+        intentions["coded_theme"]
+    )
+
+
+    intention_counts.columns = [
+
+        "intention_" +
+        str(column)
+        .lower()
+        .replace(" ", "_")
+
+        for column
+        in intention_counts.columns
+    ]
+
+
+    intention_counts = (
+        intention_counts
+        .reset_index()
+    )
+
+
+    analysis_data = (
+        analysis_data.merge(
+
+            intention_counts,
+
+            on="author_id",
+
+            how="left"
+        )
+    )
+
+
+# ================================================================
+# 34. SAVE MASTER ANALYTIC DATASET
+# ================================================================
+
+analysis_data.to_csv(
+
+    OUTPUT_DIR /
+    "MASTER_ANALYSIS_DATASET.csv",
+
+    index=False
+)
+
+
+analysis_data.to_excel(
+
+    OUTPUT_DIR /
+    "MASTER_ANALYSIS_DATASET.xlsx",
+
+    index=False
+)
+
+
+print(
+    "\nMaster dataset:",
+    analysis_data.shape
+)
+
+
+# ================================================================
+# 35. REGRESSION FUNCTION
+# ================================================================
+
+def run_topic_ols(
+    dataframe,
+    topic,
+    numeric_predictors=None,
+    categorical_predictors=None
+):
+
+    if numeric_predictors is None:
+        numeric_predictors = []
+
+    if categorical_predictors is None:
+        categorical_predictors = []
+
+
+    predictors = []
+
+
+    for variable in numeric_predictors:
+
+        if variable in dataframe.columns:
+            predictors.append(variable)
+
+
+    for variable in categorical_predictors:
+
+        if variable in dataframe.columns:
+            predictors.append(
+                f"C({variable})"
+            )
+
+
+    if not predictors:
+
+        print(
+            "No valid predictors supplied."
+        )
+
+        return None
+
+
+    formula = (
+        topic
+        +
+        " ~ "
+        +
+        " + ".join(predictors)
+    )
+
+
+    print(
+        "\nRegression formula:"
+    )
+
+    print(formula)
+
+
+    needed = [
+        topic
+    ] + numeric_predictors + categorical_predictors
+
+
+    needed = [
+        col
+        for col in needed
+        if col in dataframe.columns
+    ]
+
+
+    regression_data = (
+
+        dataframe[
+            needed
+        ]
+
+        .dropna()
+    )
+
+
+    if len(regression_data) < 10:
+
+        print(
+            "Too few observations."
+        )
+
+        return None
+
+
+    model = smf.ols(
+
+        formula=formula,
+
+        data=regression_data
+
+    ).fit(
+        cov_type="HC3"
+    )
+
+
+    print(
+        model.summary()
+    )
+
+
+    return model
+
+
+# ================================================================
+# 36. EXAMPLE REGRESSION
+# ================================================================
+
+# EDIT THESE COLUMN NAMES TO MATCH YOUR economy.csv
+# and authors.csv.
+
+
+economic_predictors = [
+
+    "median_income",
+
+    "college_share",
+
+    "professional_share",
+
+    "poverty_rate",
+
+    "foreign_born_share"
+]
+
+
+author_numeric_predictors = [
+
+    "birth_year",
+
+    "migration_year"
+]
+
+
+author_categorical_predictors = [
+
+    "generation",
+
+    "highest_degree",
+
+    "career_category"
+]
+
+
+# Example:
+#
+# model = run_topic_ols(
+#
+#     analysis_data,
+#
+#     topic="LDA_topic_0",
+#
+#     numeric_predictors=[
+#         "publication_year",
+#         "median_income",
+#         "college_share",
+#         "professional_share"
+#     ],
+#
+#     categorical_predictors=[
+#         "generation",
+#         "career_category"
+#     ]
+# )
+#
+#
+# Save regression:
+#
+# if model is not None:
+#
+#     with open(
+#         OUTPUT_DIR / "regression_topic0.txt",
+#         "w"
+#     ) as f:
+#
+#         f.write(
+#             model.summary().as_text()
+#         )
+
+
+# ================================================================
+# 37. MIXED-EFFECTS MODEL
+# ================================================================
+
+# This is useful when the same author has written
+# multiple works.
+#
+# The author becomes a random effect.
+
+
+def run_mixed_model(
+    dataframe,
+    topic,
+    numeric_predictors,
+    categorical_predictors=None,
+    group="author_id"
+):
+
+    if categorical_predictors is None:
+        categorical_predictors = []
+
+
+    predictors = []
+
+
+    for variable in numeric_predictors:
+
+        if variable in dataframe.columns:
+            predictors.append(variable)
+
+
+    for variable in categorical_predictors:
+
+        if variable in dataframe.columns:
+
+            predictors.append(
+                f"C({variable})"
+            )
+
+
+    formula = (
+        topic
+        +
+        " ~ "
+        +
+        " + ".join(predictors)
+    )
+
+
+    columns_needed = [
+
+        topic,
+        group
+
+    ] + numeric_predictors + categorical_predictors
+
+
+    columns_needed = [
+
+        x
+        for x in columns_needed
+        if x in dataframe.columns
+    ]
+
+
+    df = (
+        dataframe[
+            columns_needed
+        ]
+        .dropna()
+    )
+
+
+    if (
+        len(df) < 15
+        or
+        df[group].nunique() < 3
+    ):
+
+        print(
+            "Not enough observations "
+            "for mixed model."
+        )
+
+        return None
+
+
+    try:
+
+        model = smf.mixedlm(
+
+            formula,
+
+            data=df,
+
+            groups=df[group]
+
+        ).fit(
+            reml=False
+        )
+
+
+        print(
+            model.summary()
+        )
+
+
+        return model
+
+
+    except Exception as e:
+
+        print(
+            "Mixed model failed:",
+            e
+        )
+
+        return None
+
+
+# ================================================================
+# 38. OPTIONAL:
+# SUPERVISED CLASSIFICATION
+# ================================================================
+
+# After you manually annotate passages,
+# create:
+#
+# annotations.csv
+#
+# with:
+#
+# text,label
+# "She worked in the laundry...",labor
+# "Her mother wanted her to assimilate...",assimilation
+# ...
+
+
+annotations_path = (
+    DATA_DIR /
+    "annotations.csv"
+)
+
+
+if annotations_path.exists():
+
+    annotations = pd.read_csv(
+        annotations_path
+    )
+
+
+    annotations = (
+        annotations
+        .dropna(
+            subset=[
+                "text",
+                "label"
+            ]
+        )
+    )
+
+
+    if (
+        len(annotations) >= 30
+        and
+        annotations["label"].nunique() >= 2
+    ):
+
+
+        X_train, X_test, y_train, y_test = (
+
+            train_test_split(
+
+                annotations["text"],
+
+                annotations["label"],
+
+                test_size=0.20,
+
+                random_state=RANDOM_STATE,
+
+                stratify=annotations["label"]
+            )
+        )
+
+
+        classifier = Pipeline([
+
+            (
+                "tfidf",
+
+                TfidfVectorizer(
+
+                    stop_words="english",
+
+                    ngram_range=(1, 2),
+
+                    min_df=2,
+
+                    max_features=10000
+                )
+            ),
+
+            (
+                "classifier",
+
+                LogisticRegression(
+
+                    max_iter=2000,
+
+                    class_weight="balanced",
+
+                    random_state=RANDOM_STATE
+                )
+            )
+        ])
+
+
+        classifier.fit(
+            X_train,
+            y_train
+        )
+
+
+        predictions = (
+            classifier.predict(
+                X_test
+            )
+        )
+
+
+        report = classification_report(
+
+            y_test,
+
+            predictions,
+
+            zero_division=0
+        )
+
+
+        print(
+            "\nSUPERVISED CLASSIFIER"
+        )
+
+        print(report)
+
+
+        with open(
+
+            OUTPUT_DIR /
+            "classification_report.txt",
+
+            "w"
+
+        ) as f:
+
+            f.write(report)
+
+
+        labels = sorted(
+            annotations["label"]
+            .unique()
+        )
+
+
+        cm = confusion_matrix(
+
+            y_test,
+
+            predictions,
+
+            labels=labels
+        )
+
+
+        cm_dataframe = pd.DataFrame(
+
+            cm,
+
+            index=[
+                f"actual_{x}"
+                for x in labels
+            ],
+
+            columns=[
+                f"predicted_{x}"
+                for x in labels
+            ]
+        )
+
+
+        cm_dataframe.to_csv(
+
+            OUTPUT_DIR /
+            "confusion_matrix.csv"
+        )
+
+
+        joblib.dump(
+
+            classifier,
+
+            OUTPUT_DIR /
+            "logistic_regression_classifier.joblib"
+        )
+
+
+# ================================================================
+# 39. FINAL MESSAGE
+# ================================================================
+
+print(
+    "\n========================================"
+)
+
+print(
+    "ANALYSIS COMPLETE"
+)
+
+print(
+    "Results saved to:"
+)
+
+print(
+    OUTPUT_DIR.resolve()
+)
+
+print(
+    "========================================"
+)
