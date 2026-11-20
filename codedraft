@@ -206,78 +206,6 @@ works["decade"] = (
 
 
 
-
-  
-# 9. DIVIDE NOVELS INTO CHUNKS
-def chunk_text(
-    text,
-    chunk_size=1200,
-    overlap=100):
-
-    words = text.split()
-
-    chunks = []
-
-    start = 0
-
-    while start < len(words):
-
-        end = start + chunk_size
-
-        chunk = words[start:end]
-
-        if len(chunk) >= 100:
-            chunks.append(
-                " ".join(chunk))
-
-        start += chunk_size - overlap
-
-    return chunks
-
-chunk_rows = []
-
-for _, row in works.iterrows():
-
-    chunks = chunk_text(
-        row["text"],
-        CHUNK_SIZE,
-        CHUNK_OVERLAP)
-
-    for i, chunk in enumerate(chunks):
-
-        chunk_rows.append({
-
-            "chunk_id":
-                f"{row['work_id']}_chunk_{i:04d}",
-
-            "work_id":
-                row["work_id"],
-
-            "title":
-                row["title"],
-
-            "author_id":
-                row["author_id"],
-
-            "publication_year":
-                row["publication_year"],
-
-            "decade":
-                row["decade"],
-
-            "text":
-                chunk
-        })
-
-chunks = pd.DataFrame(chunk_rows)
-
-print(
-    "Number of chunks:",
-    len(chunks))
-
-
-
-
   
 # 10. TEXT CLEANING FOR LDA
 def clean_for_lda(text):
@@ -332,14 +260,6 @@ chunks["bertopic_text"] = (
 )
 
 
-# ================================================================
-# 12. SAVE CHUNKS
-# ================================================================
-
-chunks.to_csv(
-    OUTPUT_DIR / "corpus_chunks.csv",
-    index=False
-)
 
 
 # ================================================================
